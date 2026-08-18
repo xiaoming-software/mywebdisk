@@ -36,8 +36,12 @@ enum CallbackEvent {
         file_name: Vec<u8>,
         data: Vec<u8>,
     },
+    DownloadSendFailed { req_id: String, message: String },
+    WriteSendFailed { req_id: String, message: String },
     Error(String),
 }
+
+const FILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DownloadPurpose {
@@ -47,6 +51,7 @@ enum DownloadPurpose {
     SaveToLocal,
 }
 
+#[derive(Clone)]
 struct PendingDownload {
     session_id: u32,
     display_name: String,
@@ -56,7 +61,7 @@ struct PendingDownload {
     save_dest: Option<PathBuf>,
 }
 
-/// webrpc SendFile 多桶接收状态（每桶约 10MB，收齐后等 fileSent 再收尾）
+/// webrpc SendFile 多桶接收状态（每桶约 10MB）；收齐字节即可收尾，不依赖 fileSent
 struct IncomingFileDownload {
     req_id: String,
     pending: PendingDownload,
@@ -66,6 +71,7 @@ struct IncomingFileDownload {
     /// 服务端已发 fileSent（可能与最后一桶在链路上乱序，不能单独作为完成条件）
     file_sent: bool,
     expected_size: Option<u64>,
+    started_at: Instant,
 }
 
 struct PendingDelete {
@@ -129,7 +135,7 @@ struct PendingWrite {
     purpose: WritePurpose,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum WritePurpose {
     SaveText,
     CreateFile {
@@ -945,19 +951,9 @@ impl MyWebDiskApp {
         }
     }
 
-    /// 列表项在当前目录下的 API 路径（与界面所见一致，避免 `item.path` 陈旧导致下错文件）。
+    /// 列表项在当前目录下的 API 路径（始终由当前目录 + 文件名拼接，不依赖 `item.path`）。
     fn entry_api_path(current_path: &str, item: &ResourceEntry) -> String {
-        let joined = Self::join_api_path(current_path, &item.name);
-        if item.path.is_empty() {
-            return joined;
-        }
-        let path = item.path.replace('\\', "/");
-        let joined_norm = joined.replace('\\', "/");
-        if path == joined_norm || path.ends_with(&format!("/{}", item.name)) {
-            path
-        } else {
-            joined
-        }
+        Self::join_api_path(current_path, &item.name)
     }
 
     pub fn new() -> Self {
@@ -1461,7 +1457,17 @@ impl MyWebDiskApp {
         self.image_preview = Some(ImagePreviewState::Loading {
             name: name.to_string(),
         });
-        self.request_download(session_id, path, name, DownloadPurpose::Image, None, None);
+        self.request_download(
+            session_id,
+            path,
+            name,
+            DownloadPurpose::Image,
+            None,
+            None,
+            self.session_by_id(session_id)
+                .and_then(|s| s.resources.iter().find(|e| e.name == name))
+                .map(|e| e.size.max(0) as u64),
+        );
     }
 
     fn start_text_preview_download(&mut self, session_id: u32, path: &str, name: &str) {
@@ -1489,7 +1495,19 @@ impl MyWebDiskApp {
         self.text_preview = Some(TextPreviewState::Loading {
             name: name.to_string(),
         });
-        self.request_download(session_id, path, name, DownloadPurpose::Text, None, None);
+        let known_size = self
+            .session_by_id(session_id)
+            .and_then(|s| s.resources.iter().find(|e| e.name == name))
+            .map(|e| e.size.max(0) as u64);
+        self.request_download(
+            session_id,
+            path,
+            name,
+            DownloadPurpose::Text,
+            None,
+            None,
+            known_size,
+        );
     }
 
     fn start_office_edit(&mut self, session_id: u32, path: &str, name: &str, size: i64) {
@@ -1525,7 +1543,15 @@ impl MyWebDiskApp {
             "[mywebdisk-desktop][app] start_office_edit session_id={} api_path='{}'",
             session_id, path
         );
-        self.request_download(session_id, path, name, DownloadPurpose::Office, None, None);
+        self.request_download(
+            session_id,
+            path,
+            name,
+            DownloadPurpose::Office,
+            None,
+            None,
+            Some(size.max(0) as u64),
+        );
     }
 
     fn start_local_download(
@@ -1534,7 +1560,7 @@ impl MyWebDiskApp {
         path: &str,
         name: &str,
         dest_path: PathBuf,
-        _size: i64,
+        size: i64,
     ) {
         if !self.callback_connected {
             let msg = self.locale.tr("VIDEO_PLAY_NO_CALLBACK");
@@ -1559,6 +1585,7 @@ impl MyWebDiskApp {
             DownloadPurpose::SaveToLocal,
             None,
             Some(dest_path),
+            Some(size.max(0) as u64),
         );
     }
 
@@ -1756,6 +1783,7 @@ impl MyWebDiskApp {
         purpose: DownloadPurpose,
         temp_path: Option<PathBuf>,
         save_dest: Option<PathBuf>,
+        known_size: Option<u64>,
     ) {
         let req_id = match purpose {
             DownloadPurpose::Office => format!("of-{:016x}", rand::random::<u64>()),
@@ -1812,22 +1840,41 @@ impl MyWebDiskApp {
         })
         .to_string();
         eprintln!(
-            "[mywebdisk-desktop][app] request_download session_id={} req_id={} path='{}'",
+            "[mywebdisk-desktop][app] request_download session_id={} req_id={} path='{}' known_size={known_size:?}",
             session_id, req_id, path
         );
-        self.pending_download_requests.insert(
-            req_id.clone(),
-            PendingDownload {
-                session_id,
-                display_name: display_name.to_string(),
-                path: path.to_string(),
-                purpose,
-                temp_path,
-                save_dest,
+        let write_path = match purpose {
+            DownloadPurpose::Office => temp_path.clone(),
+            DownloadPurpose::SaveToLocal => save_dest.clone(),
+            _ => None,
+        };
+        let pending = PendingDownload {
+            session_id,
+            display_name: display_name.to_string(),
+            path: path.to_string(),
+            purpose,
+            temp_path,
+            save_dest,
+        };
+        self.pending_download_requests
+            .insert(req_id.clone(), pending.clone());
+        // 发请求前就登记接收槽，避免 SendFile 桶或 fileSent 早于 JSON ack 被丢弃
+        self.awaiting_file_downloads.insert(
+            session_id,
+            IncomingFileDownload {
+                req_id: req_id.clone(),
+                pending,
+                write_path,
+                memory: Vec::new(),
+                bytes_received: 0,
+                file_sent: false,
+                expected_size: known_size,
+                started_at: Instant::now(),
             },
         );
         let ipc_holder = Arc::clone(&self.ipc);
         let req_id_log = req_id.clone();
+        let callback_tx = self.callback_tx.clone();
         thread::spawn(move || {
             let send_result = match ipc_holder.lock() {
                 Ok(guard) => {
@@ -1843,6 +1890,10 @@ impl MyWebDiskApp {
                 eprintln!(
                     "[mywebdisk-desktop][app] request_download send failed req_id={req_id_log} err={e}"
                 );
+                let _ = callback_tx.send(CallbackEvent::DownloadSendFailed {
+                    req_id: req_id_log,
+                    message: e,
+                });
             }
         });
     }
@@ -1859,6 +1910,17 @@ impl MyWebDiskApp {
             return;
         }
         if !resp.ok {
+            if self
+                .awaiting_file_downloads
+                .get(&session_id)
+                .is_some_and(|i| i.req_id == resp.id)
+            {
+                if let Some(incoming) = self.awaiting_file_downloads.remove(&session_id) {
+                    if let Some(path) = incoming.write_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
             let message = resp.error.clone().unwrap_or_else(|| match pending.purpose {
                 DownloadPurpose::Text => self.locale.tr("TEXT_PREVIEW_ERROR"),
                 DownloadPurpose::Office => self.locale.tr("OFFICE_OPEN_FAILED"),
@@ -1868,27 +1930,25 @@ impl MyWebDiskApp {
             self.set_download_error(pending, message);
             return;
         }
-        eprintln!(
-            "[mywebdisk-desktop][app] download ack ok id={} awaiting file stream session_id={}",
-            resp.id, session_id
-        );
-        let write_path = match pending.purpose {
-            DownloadPurpose::Office => pending.temp_path.clone(),
-            DownloadPurpose::SaveToLocal => pending.save_dest.clone(),
-            _ => None,
+        let Some(incoming) = self.awaiting_file_downloads.get_mut(&session_id) else {
+            eprintln!(
+                "[mywebdisk-desktop][app] download ack ok but no receive slot session_id={} id={}",
+                session_id, resp.id
+            );
+            return;
         };
-        self.awaiting_file_downloads.insert(
-            session_id,
-            IncomingFileDownload {
-                req_id: resp.id.clone(),
-                pending,
-                write_path,
-                memory: Vec::new(),
-                bytes_received: 0,
-                file_sent: false,
-                expected_size: None,
-            },
+        if incoming.req_id != resp.id {
+            eprintln!(
+                "[mywebdisk-desktop][app] download ack id mismatch expected={} got={}",
+                incoming.req_id, resp.id
+            );
+            return;
+        }
+        eprintln!(
+            "[mywebdisk-desktop][app] download ack ok id={} awaiting file stream session_id={} received={} file_sent={}",
+            resp.id, session_id, incoming.bytes_received, incoming.file_sent
         );
+        self.try_finalize_file_download(session_id);
     }
 
     fn handle_file_sent_notification(&mut self, session_id: u32, resp: &RpcResponse) {
@@ -1934,16 +1994,18 @@ impl MyWebDiskApp {
         self.try_finalize_file_download(session_id);
     }
 
+    fn download_bytes_complete(incoming: &IncomingFileDownload) -> bool {
+        match incoming.expected_size {
+            Some(exp) => incoming.bytes_received >= exp,
+            None => incoming.file_sent && incoming.bytes_received > 0,
+        }
+    }
+
     fn try_finalize_file_download(&mut self, session_id: u32) {
         let ready = self
             .awaiting_file_downloads
             .get(&session_id)
-            .is_some_and(|i| {
-                i.file_sent
-                    && i
-                        .expected_size
-                        .is_some_and(|exp| i.bytes_received >= exp)
-            });
+            .is_some_and(Self::download_bytes_complete);
         if !ready {
             return;
         }
@@ -3288,6 +3350,7 @@ impl MyWebDiskApp {
         );
         let ipc_holder = Arc::clone(&self.ipc);
         let req_id_log = req_id.clone();
+        let callback_tx = self.callback_tx.clone();
         thread::spawn(move || {
             let send_result = match ipc_holder.lock() {
                 Ok(guard) => {
@@ -3307,6 +3370,10 @@ impl MyWebDiskApp {
                 eprintln!(
                     "[mywebdisk-desktop][app] request_write send failed req_id={req_id_log} err={e}"
                 );
+                let _ = callback_tx.send(CallbackEvent::WriteSendFailed {
+                    req_id: req_id_log,
+                    message: e,
+                });
             }
         });
     }
@@ -3386,11 +3453,97 @@ impl MyWebDiskApp {
         }
     }
 
+    fn normalize_api_path(path: &str) -> String {
+        path.trim()
+            .trim_start_matches('/')
+            .replace('\\', "/")
+    }
+
+    fn api_paths_equal(a: &str, b: &str) -> bool {
+        Self::normalize_api_path(a) == Self::normalize_api_path(b)
+    }
+
+    fn finish_text_write_response(
+        &mut self,
+        pending: PendingWrite,
+        resp: &RpcResponse,
+    ) {
+        let Some(TextPreviewState::Ready {
+            path,
+            content,
+            saved_snapshot,
+            saving,
+            status_line,
+            status_error,
+            ..
+        }) = self.text_preview.as_mut()
+        else {
+            eprintln!(
+                "[mywebdisk-desktop][app] write response ignored id={} reason=no_text_preview",
+                resp.id
+            );
+            return;
+        };
+        *saving = false;
+        if !Self::api_paths_equal(path, &pending.path) {
+            eprintln!(
+                "[mywebdisk-desktop][app] write response ignored id={} preview_path='{}' pending_path='{}'",
+                resp.id, path, pending.path
+            );
+            *status_line = self.locale.tr("TEXT_PREVIEW_SAVE_FAILED");
+            *status_error = true;
+            return;
+        }
+        if !resp.ok {
+            let detail = resp
+                .error
+                .clone()
+                .unwrap_or_else(|| self.locale.tr("TEXT_PREVIEW_SAVE_FAILED"));
+            *status_line = detail.clone();
+            *status_error = true;
+            eprintln!(
+                "[mywebdisk-desktop][app] write failed id={} path='{}' error={}",
+                resp.id, pending.path, detail
+            );
+            return;
+        }
+        *saved_snapshot = content.clone();
+        *status_line = self.locale.tr("TEXT_PREVIEW_SAVED");
+        *status_error = false;
+        let new_size = content.len() as i64;
+        if let Some(session) = self.session_mut_by_id(pending.session_id) {
+            let pending_norm = Self::normalize_api_path(&pending.path);
+            if let Some(entry) = session
+                .resources
+                .iter_mut()
+                .find(|e| Self::api_paths_equal(&e.path, &pending_norm))
+            {
+                entry.size = new_size;
+            } else if let Some(name) = pending_norm.rsplit('/').next() {
+                if let Some(entry) = session.resources.iter_mut().find(|e| e.name == name) {
+                    entry.size = new_size;
+                }
+            }
+        }
+        eprintln!(
+            "[mywebdisk-desktop][app] write ok id={} path='{}' bytes={}",
+            resp.id, pending.path, new_size
+        );
+    }
+
     fn handle_write_response(&mut self, session_id: u32, resp: &RpcResponse) {
         let Some(pending) = self.pending_write_requests.remove(&resp.id) else {
+            eprintln!(
+                "[mywebdisk-desktop][app] write response orphan id={} session_id={}",
+                resp.id, session_id
+            );
             return;
         };
         if pending.session_id != session_id {
+            eprintln!(
+                "[mywebdisk-desktop][app] write response session mismatch id={} expected={} got={}",
+                resp.id, pending.session_id, session_id
+            );
             return;
         }
         match pending.purpose {
@@ -3410,6 +3563,12 @@ impl MyWebDiskApp {
                     if let Some(session) = self.session_mut_by_id(session_id) {
                         session.last_error = msg;
                     }
+                    eprintln!(
+                        "[mywebdisk-desktop][app] create file failed id={} name='{}' error={}",
+                        resp.id,
+                        display_name,
+                        detail
+                    );
                     return;
                 }
                 let msg = self
@@ -3420,47 +3579,15 @@ impl MyWebDiskApp {
                     session.last_error = msg;
                 }
                 self.request_list(session_id, &current_path);
-                return;
+                eprintln!(
+                    "[mywebdisk-desktop][app] create file ok id={} name='{}'",
+                    resp.id, display_name
+                );
             }
-            WritePurpose::SaveText => {}
-        }
-        let Some(TextPreviewState::Ready {
-            path,
-            content,
-            saved_snapshot,
-            saving,
-            status_line,
-            status_error,
-            ..
-        }) = self.text_preview.as_mut()
-        else {
-            return;
-        };
-        if path.as_str() != pending.path.as_str() {
-            return;
-        }
-        *saving = false;
-        if !resp.ok {
-            *status_line = resp
-                .error
-                .clone()
-                .unwrap_or_else(|| self.locale.tr("TEXT_PREVIEW_SAVE_FAILED"));
-            *status_error = true;
-            return;
-        }
-        *saved_snapshot = content.clone();
-        *status_line = self.locale.tr("TEXT_PREVIEW_SAVED");
-        *status_error = false;
-        let new_size = content.len() as i64;
-        if let Some(session) = self.session_mut_by_id(session_id) {
-            if let Some(entry) = session.resources.iter_mut().find(|e| e.path == pending.path) {
-                entry.size = new_size;
+            WritePurpose::SaveText => {
+                self.finish_text_write_response(pending, resp);
             }
         }
-        eprintln!(
-            "[mywebdisk-desktop][app] write ok id={} path='{}' bytes={}",
-            resp.id, pending.path, new_size
-        );
     }
 
     fn draw_text_preview(&mut self, ctx: &egui::Context) {
@@ -3746,6 +3873,41 @@ impl MyWebDiskApp {
         self.sessions.iter_mut().find(|s| s.id == session_id)
     }
 
+    fn poll_download_timeouts(&mut self) {
+        let now = Instant::now();
+        let timed_out: Vec<(u32, PendingDownload)> = self
+            .awaiting_file_downloads
+            .iter()
+            .filter(|(_, incoming)| now.duration_since(incoming.started_at) > FILE_DOWNLOAD_TIMEOUT)
+            .map(|(sid, incoming)| (*sid, incoming.pending.clone()))
+            .collect();
+        for (session_id, pending) in timed_out {
+            eprintln!(
+                "[mywebdisk-desktop][app] download timeout session_id={} req_id={}",
+                session_id,
+                self.awaiting_file_downloads
+                    .get(&session_id)
+                    .map(|i| i.req_id.as_str())
+                    .unwrap_or("?")
+            );
+            if let Some(incoming) = self.awaiting_file_downloads.remove(&session_id) {
+                if let Some(path) = incoming.write_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.pending_download_requests.remove(&incoming.req_id);
+                let message = match pending.purpose {
+                    DownloadPurpose::Text => self.locale.tr("TEXT_PREVIEW_ERROR"),
+                    DownloadPurpose::Office => self.locale.tr("OFFICE_OPEN_FAILED"),
+                    DownloadPurpose::SaveToLocal => {
+                        self.locale.tr("FILE_DOWNLOAD_FAILED").replace("%s", "")
+                    }
+                    DownloadPurpose::Image => self.locale.tr("IMAGE_PREVIEW_ERROR"),
+                };
+                self.set_download_error(pending, message);
+            }
+        }
+    }
+
     fn poll_callback_events(&mut self) {
         while let Ok(event) = self.callback_rx.try_recv() {
             match event {
@@ -3762,6 +3924,44 @@ impl MyWebDiskApp {
                     data,
                 } => {
                     self.handle_callback_file(session_id, &file_name, &data);
+                }
+                CallbackEvent::DownloadSendFailed { req_id, message } => {
+                    let Some(pending) = self.pending_download_requests.remove(&req_id) else {
+                        continue;
+                    };
+                    if let Some(incoming) = self.awaiting_file_downloads.remove(&pending.session_id)
+                    {
+                        if let Some(path) = incoming.write_path {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                    eprintln!(
+                        "[mywebdisk-desktop][app] download send failed req_id={req_id} err={message}"
+                    );
+                    self.set_download_error(pending, message);
+                }
+                CallbackEvent::WriteSendFailed { req_id, message } => {
+                    let Some(pending) = self.pending_write_requests.remove(&req_id) else {
+                        continue;
+                    };
+                    if pending.purpose == WritePurpose::SaveText {
+                        if let Some(TextPreviewState::Ready {
+                            saving,
+                            status_line,
+                            status_error,
+                            ..
+                        }) = self.text_preview.as_mut()
+                        {
+                            *saving = false;
+                            *status_line = message.clone();
+                            *status_error = true;
+                        }
+                    } else if let Some(session) = self.session_mut_by_id(pending.session_id) {
+                        session.last_error = message.clone();
+                    }
+                    eprintln!(
+                        "[mywebdisk-desktop][app] write send failed req_id={req_id} err={message}"
+                    );
                 }
                 CallbackEvent::Error(msg) => {
                     self.callback_connected = false;
@@ -4132,6 +4332,7 @@ impl eframe::App for MyWebDiskApp {
         self.poll_login();
         self.poll_open_session();
         self.poll_callback_events();
+        self.poll_download_timeouts();
         self.poll_finder_upload(ctx);
 
         let (win_w, win_h) = match self.screen {

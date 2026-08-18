@@ -230,15 +230,35 @@ func (h *Handler) handleWrite(sessionID uint32, req protocol.Request) {
 		h.replyErr(sessionID, req.ID, err)
 		return
 	}
+	// 文件若只读（常见于复制/迁移工作区后），先尝试恢复写权限再写入
+	if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+		if info.Mode().Perm()&0200 == 0 {
+			_ = os.Chmod(abs, (info.Mode().Perm() | 0600))
+		}
+	}
 	if err := os.WriteFile(abs, []byte(req.Content), 0o644); err != nil {
+		if os.IsPermission(err) {
+			h.reply(sessionID, protocol.Response{
+				ID: req.ID, OK: false,
+				Error: "permission denied: workspace files are read-only; check --path directory permissions",
+			})
+			return
+		}
 		h.replyErr(sessionID, req.ID, err)
 		return
 	}
 	apiPath, _ := h.WS.Rel(abs)
-	h.reply(sessionID, protocol.Response{
+	respBody, err := json.Marshal(protocol.Response{
 		ID: req.ID, OK: true,
 		Data: map[string]any{"path": apiPath, "size": len(req.Content)},
 	})
+	if err != nil {
+		h.replyErr(sessionID, req.ID, err)
+		return
+	}
+	if ret := h.Client.SendData(sessionID, respBody, sendTimeoutMs); ret == 0 {
+		log.Printf("session %d: write response SendData failed id=%s", sessionID, req.ID)
+	}
 	log.Printf("session %d: write id=%s path=%q bytes=%d", sessionID, req.ID, apiPath, len(req.Content))
 }
 
@@ -345,22 +365,44 @@ func (h *Handler) handleDownload(sessionID uint32, req protocol.Request) {
 		return
 	}
 
-	h.reply(sessionID, protocol.Response{ID: req.ID, OK: true, Data: map[string]string{"message": "sending file"}})
+	// 同步发出 ack，确保对端先进入接收状态再开始 SendFile，避免桶与 fileSent 乱序丢失
+	ackBody, err := json.Marshal(protocol.Response{
+		ID: req.ID, OK: true, Data: map[string]string{"message": "sending file"},
+	})
+	if err != nil {
+		h.replyErr(sessionID, req.ID, err)
+		return
+	}
+	if ret := h.Client.SendData(sessionID, ackBody, sendTimeoutMs); ret == 0 {
+		log.Printf("session %d: download ack SendData failed id=%s", sessionID, req.ID)
+		h.replyErr(sessionID, req.ID, errors.New("send download ack failed"))
+		return
+	}
 
 	go func() {
 		ret := h.Client.SendFile(sessionID, abs)
 		if ret == 0 {
 			log.Printf("session %d: SendFile %s failed, ret=%d", sessionID, abs, ret)
-			h.reply(sessionID, protocol.Response{
+			doneBody, mErr := json.Marshal(protocol.Response{
 				ID: req.ID, OK: false, Error: "send file failed",
 				Data: map[string]any{"fileSent": false},
 			})
+			if mErr == nil {
+				_ = h.Client.SendData(sessionID, doneBody, sendTimeoutMs)
+			}
 			return
 		}
-		h.reply(sessionID, protocol.Response{
+		doneBody, err := json.Marshal(protocol.Response{
 			ID: req.ID, OK: true,
 			Data: map[string]any{"fileSent": true, "size": info.Size()},
 		})
+		if err != nil {
+			log.Printf("session %d: marshal fileSent: %v", sessionID, err)
+			return
+		}
+		if ret := h.Client.SendData(sessionID, doneBody, sendTimeoutMs); ret == 0 {
+			log.Printf("session %d: fileSent SendData failed id=%s", sessionID, req.ID)
+		}
 		log.Printf("session %d: download complete id=%s path=%q bytes=%d", sessionID, req.ID, req.Path, info.Size())
 	}()
 }
