@@ -1,5 +1,0 @@
-/mywebdisk-server
-/dist/
-/internal/webrpc/runtimelib/**/*
-!/internal/webrpc/runtimelib/README.md
-!/internal/webrpc/runtimelib/.gitignore

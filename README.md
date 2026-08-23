@@ -1,213 +1,299 @@
 # MyWebDisk
 
-基于 **webrpc P2P** 的个人网盘系统。远程客户端通过点对点加密通道，直接读写服务端指定目录下的文件，无需公网 IP 或自建 HTTP 服务。
+**无公网 IP 的个人 NAS / 私人网盘服务端** — Personal NAS server over P2P (webrpc)
 
-```
-mywebdisk/
-├── sdk/                 # 全平台共用的 webrpc 静态库与头文件
-├── mywebdisk-server/    # Go 服务端：工作区文件 API + webrpc 接入
-├── mywebdisk-desktop/   # Rust + egui 桌面客户端
-├── mywebdisk-app/       # 移动端客户端（预留，Godot 工程目录）
-├── scripts/             # 环境安装脚本
-└── test.sh              # 桌面端运行与日志采集
-```
+人在外面也能浏览、上传、下载家里电脑或 NAS 上的文件。不需要公网 IP、不需要路由器端口映射、也不把文件上传到第三方网盘。传输走 [webrpc](https://www.webrpc.cn/controllor.html) 加密 P2P 通道；手机和电脑端用 [File2File](https://github.com/xiaoming-software/File2File-Desktop) 桌面客户端连接并操作网盘。
+
+[English README](README.en.md)
+
+**关键词：** 个人 NAS、私人网盘、无公网 IP、P2P 网盘、webrpc、File2File、macOS / Linux / Windows、树莓派、ARM NAS
 
 ---
 
-## 项目介绍
+## 目录
 
-| 子项目 | 技术栈 | 说明 |
-|--------|--------|------|
-| **mywebdisk-server** | Go + webrpc SDK | 在本地目录上提供网盘文件操作，等待远程客户端 P2P 连接 |
-| **mywebdisk-desktop** | Rust + egui + webrpc SDK | 跨平台桌面客户端，登录、连接远程网盘、浏览与管理文件 |
-| **mywebdisk-app** | Godot（预留） | 移动端客户端工程目录，当前为空，后续可扩展 iOS / Android |
-| **sdk** | C 静态库 | `WebrpcClient_*` API，供 server / desktop 静态或动态链接 |
-
-通信链路：**桌面客户端 ↔ webrpc P2P ↔ 服务端**，控制指令走 JSON 数据流，大文件走文件流（约 10MB/桶，自动多桶传输）。
-
----
-
-## 功能特性
-
-### 服务端（mywebdisk-server）
-
-- 指定本地目录作为网盘工作区（`--path`）
-- 通过 webrpc 注册 token / passwd / permission，等待远程连接
-- 支持 JSON 控制操作：
-  - `list` / `stat` — 列目录、查文件信息
-  - `mkdir` / `delete` / `rename` — 新建文件夹、删除、重命名
-  - `download` — 多桶 SendFile 下载
-  - `upload` + `upload_done` — 多桶 SendFile 上传（>10MB 自动分桶）
-  - `write` — 文本内容写入（在线编辑保存，单文件上限 50MB）
-  - `download_stream` — 流媒体分块下载
-  - `health` — 健康检查
-- 路径安全：相对工作区根目录，禁止 `../` 越界
-- 单文件可执行程序：webrpc 运行时库通过 `go:embed` 打包，**dist 无需额外附带 .dylib/.so/.dll**
-
-### 桌面客户端（mywebdisk-desktop）
-
-- **登录与会话**：token + passwd 登录 webrpc；可连接多个远程网盘会话
-- **资源管理器**（Finder 风格）：
-  - 目录浏览、返回上级、刷新
-  - 上传文件（系统选文件 → 进度条 → 成功提示）
-  - 右键空白区新建文件夹 / 新建文件
-  - 每行操作：下载到本地、删除
-- **在线预览与编辑**：
-  - 图片预览（≤50MB）
-  - 文本预览与保存（≤50MB，UTF-8）
-  - 视频 / 音频在线播放（≤200MB，系统默认播放器）
-  - Office 文档：下载到临时目录 → 系统打开 → 关闭会话时检测修改并自动回写
-- **界面**：霓虹蓝绿主题、中英文切换
-- **打包**：macOS `.app`、Windows `.exe`，静态链接 webrpc SDK
-
-### 移动端（mywebdisk-app）
-
-当前为**预留目录**，尚未实现。`scripts/setup-env.sh` 已包含 Godot 4.6 编辑器与导出模板安装，便于后续开发移动端客户端。
+- [它解决什么问题](#它解决什么问题)
+- [功能一览](#功能一览)
+- [工作原理](#工作原理)
+- [界面预览](#界面预览)
+- [你需要准备什么](#你需要准备什么)
+- [各平台部署](#各平台部署)
+- [启动服务端](#启动服务端)
+- [用 File2File 连接网盘](#用-file2file-连接网盘)
+- [从源码编译](#从源码编译)
+- [安全说明](#安全说明)
+- [常见问题](#常见问题)
+- [相关项目](#相关项目)
 
 ---
 
-## 特性与优势
+## 它解决什么问题
 
-1. **真正的 P2P**：基于 webrpc 点对点网络，不依赖中心服务器转发文件流量
-2. **单文件部署**：server 与 desktop 构建产物均为单可执行文件，携带 webrpc 运行时，分发简单
-3. **大文件友好**：SendFile 按约 10MB/桶传输，上传与下载均支持多桶，可稳定处理 GB 级文件
-4. **完整文件管理**：浏览、上传、下载、新建、删除、重命名、在线预览与编辑
-5. **跨平台**：server 支持 macOS / Linux / Windows；desktop 支持 macOS / Windows
-6. **安全边界**：工作区路径校验，防止目录穿越
-7. **轻量 UI**：Rust + egui 原生桌面应用，无需浏览器
+把家里的 Mac、Windows 电脑、Linux 小主机或 ARM NAS 变成一台**只属于你的网盘**：
+
+| 常见做法 | 痛点 | MyWebDisk |
+| --- | --- | --- |
+| 公有云网盘 | 文件离开自己的硬盘，容量与隐私受限 | 文件始终在你指定的本地目录 |
+| 公网 IP + 端口映射 / frp | 运营商没公网 IP，穿透配置复杂 | 不需要公网 IP，webrpc 负责打洞 |
+| 自建 WebDAV / SMB 暴露公网 | 暴露端口、证书、防火墙 | 对端必须同时知道 Token 和口令 |
+
+适合：出差访问家里照片和文档、跨网络取安装包、给自己搭一台私人云盘。
 
 ---
 
-## 快速开始
+## 功能一览
 
-### 1. 编译服务端
+服务端是一条命令即可运行的 Go 程序。绑定一个本地目录后，经 File2File 可完成：
+
+- **浏览目录**：列表 / 图标视图，路径限制在 `--path` 内，禁止 `../` 越界
+- **磁盘信息**：总容量、剩余、已用、文件数量
+- **上传 / 下载**：大文件分块传输
+- **新建、重命名、移动、删除** 文件和文件夹
+- **搜索** 网盘内文件名
+- **打包文件夹** 为 zip（带进度）
+
+webrpc 运行库已嵌入各平台可执行文件，**发布目录里不需要再附带** `.so` / `.dylib` / `.dll`。
+
+---
+
+## 工作原理
+
+1. 在 NAS / 家里电脑上启动 `mywebdisk-server`，传入该设备的 webrpc **Token、密码、口令** 和本地目录。
+2. 服务端登录 webrpc，在本机回调端口上等待会话。
+3. 另一台设备打开 File2File，用**另一枚** Token 登录。
+4. 在「网盘连接」里填写服务端 Token 和同一条口令，建立 P2P 会话。
+5. 之后的列目录、上传下载都走这条加密通道，不经过中心化存储。
+
+两端都要能访问互联网以完成握手；文件内容优先点对点直传。
+
+---
+
+## 界面预览
+
+### 1. 服务端在家里电脑上运行
+
+传入 Token、密码、口令和 NAS 目录后，登录成功即进入待命：
+
+![mywebdisk-server 运行日志：webrpc 登录成功并等待客户端会话](img/mywebdisk-server-run.png)
+
+### 2. File2File 连接网盘（连接前）
+
+客户端已登录后，在左侧「网盘连接」选择节点，弹出「请先连接网盘」，填写**网盘 Token** 和**认证口令**（与服务端 `--permission` 一致）：
+
+![File2File 连接网盘前：输入网盘 Token 与认证口令](img/link-mywebdisk.png)
+
+### 3. 连接成功后的网盘内容
+
+连通后可看磁盘用量、搜索、上传，并以列表或图标浏览家里的文件：
+
+![File2File 已连接个人 NAS，浏览家里网盘文件与磁盘用量](img/mywebdisk-client.png)
+
+---
+
+## 你需要准备什么
+
+1. **两枚 webrpc Token**（一枚给服务端，一枚给 File2File）  
+   在 [webrpc 控制台](https://www.webrpc.cn/controllor.html) 注册后，到「我的 Token」复制 **Token 值** 和 **密码**。
+2. **口令（permission）**  
+   服务端启动时设置，File2File 连接网盘时必须填同一条。不要留空。
+3. **一块本地磁盘目录**  
+   例如 `/Users/you/mywebdisk_space`、`D:\nas`、`/mnt/data/nas`。不存在会自动创建。
+4. **客户端**  
+   安装 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop)。
+
+---
+
+## 各平台部署
+
+仓库 [`dist/`](dist/) 目录已提供各平台单文件程序。下载对应文件、赋予执行权限后即可运行。
+
+| 平台 | 架构 | 仓库内路径 | 适用机器 |
+| --- | --- | --- | --- |
+| macOS 11+ | Apple Silicon (arm64) | [`dist/darwin-arm64/mywebdisk-server`](dist/darwin-arm64/mywebdisk-server) | M 系列 Mac |
+| Linux | x86_64 (amd64) | [`dist/linux-amd64/mywebdisk-server`](dist/linux-amd64/mywebdisk-server) | 普通 x86 NAS / 小主机 / 云主机 |
+| Linux | ARM64 | [`dist/linux-arm64/mywebdisk-server`](dist/linux-arm64/mywebdisk-server) | 树莓派 64 位、ARM NAS、部分软路由 |
+| Windows 10/11 | x64 | [`dist/windows-amd64/mywebdisk-server.exe`](dist/windows-amd64/mywebdisk-server.exe) | 家里的 Windows 电脑 |
+
+单文件即可，无需再安装 webrpc SDK 或配置动态库路径。
+
+### macOS (Apple Silicon)
 
 ```bash
-cd mywebdisk-server
+chmod +x dist/darwin-arm64/mywebdisk-server
+./dist/darwin-arm64/mywebdisk-server \
+  --token=你的服务端Token \
+  --passwd=Token密码 \
+  --permission=你设的口令 \
+  --path=/Users/你/mywebdisk_space
+```
+
+若系统提示「无法验证开发者」，在「系统设置 → 隐私与安全性」中允许，或执行：
+
+```bash
+xattr -dr com.apple.quarantine dist/darwin-arm64/mywebdisk-server
+```
+
+### Linux x86_64
+
+```bash
+chmod +x dist/linux-amd64/mywebdisk-server
+./dist/linux-amd64/mywebdisk-server \
+  --token=你的服务端Token \
+  --passwd=Token密码 \
+  --permission=你设的口令 \
+  --path=/mnt/data/nas
+```
+
+长期挂在 NAS / 小主机上，可用 systemd（把路径和参数改成你的）：
+
+```ini
+# /etc/systemd/system/mywebdisk.service
+[Unit]
+Description=MyWebDisk personal NAS (webrpc P2P)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/mywebdisk/mywebdisk-server --token=TOKEN --passwd=PASSWD --permission=PIN --path=/mnt/data/nas
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now mywebdisk
+```
+
+### Linux ARM64（树莓派 / ARM NAS）
+
+```bash
+chmod +x dist/linux-arm64/mywebdisk-server
+./dist/linux-arm64/mywebdisk-server \
+  --token=你的服务端Token \
+  --passwd=Token密码 \
+  --permission=你设的口令 \
+  --path=/mnt/usb/nas
+```
+
+请使用 **64 位** 系统镜像。32 位 ARM 不在当前发布范围内。
+
+### Windows x64
+
+在 PowerShell 或「命令提示符」中：
+
+```bat
+dist\windows-amd64\mywebdisk-server.exe --token=服务端Token --passwd=Token密码 --permission=口令 --path=D:\nas
+```
+
+关机后若要自动起来，可把上述命令做成开机启动脚本，或放到「任务计划程序」。保持窗口不关，或用 nssm 等工具注册为服务。
+
+---
+
+## 启动服务端
+
+四个参数都必填：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--token` | 这台 NAS 设备的 webrpc Token |
+| `--passwd` | 该 Token 在控制台里的密码 |
+| `--permission` | 口令。File2File「认证口令」必须与此相同 |
+| `--path` | 作为网盘根目录的本地路径；不存在则创建 |
+
+成功时日志大致如下：
+
+```text
+webrpc 客户端已创建，等待登录...
+webrpc 登录成功 status=1
+NAS 目录: /Users/a1/mywebdisk_space
+服务已就绪，等待客户端通过 webrpc 建立会话
+已连接 webrpc 回调端口 127.0.0.1:xxxxx
+```
+
+看到「服务已就绪」后再去开 File2File。登录失败会在约 30 秒超时，请核对 Token、密码和网络。`Ctrl+C` 退出。
+
+---
+
+## 用 File2File 连接网盘
+
+客户端仓库：[xiaoming-software/File2File-Desktop](https://github.com/xiaoming-software/File2File-Desktop)
+
+1. 安装并启动 File2File（macOS / Windows / Linux 均可）。
+2. 用**客户端自己的** webrpc Token 和密码登录。认证口令可按 File2File 说明填写；这与网盘口令不是同一件事。
+3. 左侧找到 **网盘连接**，点 **新建连接** 或选已保存的节点（例如「家里网盘mac」）。
+4. 在「请先连接网盘」窗口填写：
+   - **网盘 Token**：服务端 `--token`
+   - **认证口令**：服务端 `--permission`
+5. 点 **连接**。成功后即可看磁盘用量、浏览目录、上传、搜索。
+
+服务端必须先在线。只知道 Token 但口令不对，无法建立会话。
+
+---
+
+## 从源码编译
+
+环境：Go 1.22+，仓库内 `sdk/` 已包含各平台 webrpc 动态库。
+
+```bash
+git clone https://github.com/xiaoming-software/mywebdisk.git
+cd mywebdisk
 ./build.sh
 ```
 
-产物示例：
+产物：
 
-| 路径 | 平台 |
-|------|------|
-| `dist/darwin-arm64/mywebdisk-server` | macOS Apple Silicon |
-| `dist/linux-amd64/mywebdisk-server` | Linux x86_64 |
-| `dist/linux-arm64/mywebdisk-server` | Linux arm64 |
-| `dist/windows-amd64/mywebdisk-server.exe` | Windows x86_64 |
-
-### 2. 启动服务端
-
-```bash
-./mywebdisk-server/dist/darwin-arm64/mywebdisk-server \
-  --path=/home/tem \
-  --token=webroc_token \
-  --passwd=123456 \
-  --permission=123456abcd
+```text
+dist/darwin-arm64/mywebdisk-server
+dist/linux-amd64/mywebdisk-server
+dist/linux-arm64/mywebdisk-server
+dist/windows-amd64/mywebdisk-server.exe
 ```
 
-| 参数 | 说明 |
-|------|------|
-| `--path` | 工作区根目录（必填） |
-| `--token` | webrpc token（必填） |
-| `--passwd` | webrpc 密码（必填） |
-| `--permission` | webrpc 口令（必填） |
-
-### 3. 编译桌面客户端
-
-```bash
-cd mywebdisk-desktop
-./build.sh
-```
-
-- macOS：`dist/macos/MyWebDisk.app`
-- Windows：`dist/windows/MyWebDisk.exe`（需 mingw-w64 或在 Windows 本机构建）
-
-### 4. 运行桌面客户端
-
-```bash
-# macOS 双击或命令行
-open mywebdisk-desktop/dist/macos/MyWebDisk.app
-
-# 或从仓库根目录（带日志）
-./test.sh
-```
-
-日志输出：`/tmp/mywebdisk-desktop-run.log`
-
-### 5. 连接远程网盘
-
-1. 启动桌面客户端，输入 **token** 与 **passwd** 登录
-2. 点击「连接我的网盘」，填写**目标 token**（服务端 token）与**口令**
-3. 连接成功后，在资源管理器中浏览、上传、下载、新建文件/文件夹
+在 Apple Silicon Mac 上可一次编出上述四个目标（`CGO_ENABLED=0` 交叉编译，无需 zig）。
 
 ---
 
-## 开发调试
+## 安全说明
 
-### 桌面端
-
-```bash
-cd mywebdisk-desktop
-./dev.sh && cargo run          # 终端调试
-./build.sh && ./run.sh         # 仅 GUI，无终端
-```
-
-### 环境安装（macOS）
-
-```bash
-./scripts/setup-env.sh
-```
-
-安装 Godot 4.6、交叉编译工具（zig / mingw-w64）等。
-
-### webrpc SDK
-
-位于 `sdk/`，详见 [sdk/README.md](sdk/README.md)。
-
-主要 C API：
-
-- `WebrpcClient_New` / `WebrpcClient_LoginStatus` / `WebrpcClient_GetReceivePort`
-- `WebrpcClient_OpenSession` / `WebrpcClient_CloseSession`
-- `WebrpcClient_SendData` / `WebrpcClient_SendFile`
-- `WebrpcClient_Free`
+- 口令用于限制谁能 `OpenSession` 连上这台 NAS，请使用足够长的随机口令，不要提交到 Git。
+- 所有文件操作都被限制在 `--path` 目录内。
+- webrpc 通道默认加密；平台不托管你的文件内容。
+- 仅供合法个人与商业使用。禁止用于法律法规不允许的内容与活动，详见 [webrpc 合规说明](https://www.webrpc.cn/controllor.html)。
+- Token、密码、口令等同于网盘钥匙，不要发给不信任的人。
 
 ---
 
-## 通信协议概要
+## 常见问题
 
-回调 TCP 帧格式：**4 字节 sessionId（大端）+ 1 字节类型**
+**Q：没有公网 IP 能用吗？**  
+能。这是本项目的主要使用场景。两端能上网即可尝试握手。
 
-| 类型 | 含义 |
-|------|------|
-| `1` | 文件流（SendFile 多桶数据） |
-| `2` | JSON 数据流（控制指令与响应） |
+**Q：File2File 登录用的 Token 和服务端是同一枚吗？**  
+不要共用。一枚给家里的 `mywebdisk-server`，另一枚给出门用的 File2File。连接网盘时，在客户端里填**服务端那枚** Token 和口令。
 
-数据流 JSON 请求示例：
+**Q：登录一直超时？**  
+检查 Token / 密码是否从「我的 Token」原样复制、机器能否访问外网、是否用了对应系统的二进制（不要在 Linux 上跑 macOS 文件）。
 
-```json
-{"id":"req-001","op":"list","path":""}
-{"id":"req-002","op":"upload","path":"docs/readme.txt"}
-{"id":"req-003","op":"upload_done","size":12345}
-{"id":"req-004","op":"write","path":"notes.txt","content":"hello"}
-```
+**Q：连接网盘失败？**  
+确认服务端日志已是「服务已就绪」、服务端进程还在跑、口令与 `--permission` 完全一致、客户端已登录且网络可达。
 
-上传 / 下载大文件流程：
+**Q：支持 Intel Mac / Android / iOS 服务端吗？**  
+当前发布的是 darwin-arm64、linux-amd64、linux-arm64、windows-amd64。Android / iOS 不做 NAS 服务端。Intel Mac 不在预编译列表中。
 
-1. 客户端发送 `upload` 或 `download` 准备指令
-2. 通过 `SendFile` 按约 10MB/桶传输文件数据
-3. 上传完成后客户端发送 `upload_done`（含总字节数）；下载完成后服务端回复 `fileSent: true`
+**Q：可以当多人共享网盘吗？**  
+协议上多个 File2File 可以连同一台服务端，但本项目按**个人 NAS** 设计：知道 Token + 口令的人都能操作该目录，请自行控制分享范围。
 
 ---
 
-## 各子项目文档
+## 相关项目
 
-- [mywebdisk-server/README.md](mywebdisk-server/README.md) — 服务端编译、运行、协议
-- [mywebdisk-desktop/README.md](mywebdisk-desktop/README.md) — 桌面端编译打包说明
-- [sdk/README.md](sdk/README.md) — webrpc SDK 引用方式
+| 项目 | 作用 |
+| --- | --- |
+| 本仓库 **MyWebDisk** | 个人 NAS 服务端 |
+| [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) | 连接并操作网盘的桌面客户端，也支持聊天与直传文件 |
+| [webrpc](https://www.webrpc.cn/controllor.html) | P2P RPC 传输与 Token 服务 |
 
----
-
-## 许可证
-
-请参阅各子项目及 SDK 提供方的许可条款。
+问题与建议请在本仓库提 Issue。请自行保管 Token 与口令。
