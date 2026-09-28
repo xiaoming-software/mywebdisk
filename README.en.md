@@ -2,11 +2,11 @@
 
 **Personal NAS / private cloud drive without a public IP** — P2P file access over [webrpc](https://www.webrpc.cn/controllor.html)
 
-Run a small Go server on a home Mac, Windows PC, Linux box, or ARM NAS. From another network, open [File2File](https://github.com/xiaoming-software/File2File-Desktop) to browse, upload, and download files that stay on *your* disk. No public IP, no router port mapping, no upload-to-someone-else’s cloud.
+Run a small Go server on a home Mac, Windows PC, Linux box, or ARM NAS. From another network, connect with [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) on a computer or [File2File App](https://github.com/xiaoming-software/File2File-App) on a phone to browse, upload, and download files that stay on *your* disk. No public IP, no router port mapping, no upload-to-someone-else’s cloud.
 
 [简体中文](README.md)
 
-**Keywords:** personal NAS, private cloud drive, no public IP, P2P file server, webrpc, File2File, macOS, Linux, Windows, Raspberry Pi, ARM NAS
+**Keywords:** personal NAS, private cloud drive, no public IP, P2P file server, webrpc, File2File, File2File App, macOS, Linux, Windows, Android, iOS, Raspberry Pi, ARM NAS
 
 ---
 
@@ -60,7 +60,7 @@ The webrpc runtime is **embedded**. You do not ship extra `.so` / `.dylib` / `.d
 
 1. On the home machine, start `mywebdisk-server` with that device’s webrpc **token, password, passphrase**, and a local folder.
 2. The process logs into webrpc and waits on the local callback port.
-3. On the remote machine, sign into File2File with a **different** token.
+3. On another computer open [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop), or on a phone open [File2File App](https://github.com/xiaoming-software/File2File-App), and sign in with a **different** token.
 4. Under **Web disk connections**, enter the *server* token and the same passphrase to open a P2P session.
 5. List / upload / download travel on that encrypted path. webrpc does not store your file payloads.
 
@@ -99,7 +99,7 @@ Disk usage, search, upload, and the home file tree:
 3. **A local folder**  
    Examples: `/Users/you/mywebdisk_space`, `D:\nas`, `/mnt/data/nas`. Created if missing.
 4. **Client app**  
-   [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop).
+   Desktop: [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop). Phone: [File2File App](https://github.com/xiaoming-software/File2File-App).
 
 ---
 
@@ -217,11 +217,12 @@ connected to webrpc callback 127.0.0.1:xxxxx
 
 ## Connect with File2File
 
-Client repo: [xiaoming-software/File2File-Desktop](https://github.com/xiaoming-software/File2File-Desktop)
+- On a computer, use [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) to connect to the disk.
+- On a phone, use [File2File App](https://github.com/xiaoming-software/File2File-App) to connect to the disk.
 
-1. Install File2File (macOS / Windows / Linux).
-2. Log in with the **client** webrpc token and password. File2File’s own optional login passphrase is *not* the NAS passphrase.
-3. In the sidebar, open **Web disk connections** → **New connection** (or a saved node).
+1. Install and start the client (desktop: macOS / Windows / Linux; phone: Android / iOS).
+2. Log in with the **client** webrpc token and password. File2File’s own login passphrase is *not* the NAS passphrase.
+3. Open **Web disk connections** (sidebar on desktop; **Disk** tab on the phone) → **New connection** (or a saved node).
 4. In **Connect to disk**, enter:
    - **Disk token**: server `--token`
    - **Auth passphrase**: server `--permission`
@@ -292,6 +293,7 @@ Several File2File clients can talk to one server, but this is built as a **perso
 | --- | --- |
 | **MyWebDisk** (this repo) | Personal NAS server |
 | [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) | Desktop client that connects to the disk (also chat and direct file send) |
+| [File2File App](https://github.com/xiaoming-software/File2File-App) | Android / iOS client that connects to the disk |
 | [webrpc](https://www.webrpc.cn/controllor.html) | P2P RPC transport and tokens |
 
 Open an Issue in this repository for bugs and ideas. Keep your tokens and passphrase private.

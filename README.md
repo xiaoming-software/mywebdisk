@@ -2,11 +2,11 @@
 
 **无公网 IP 的个人 NAS / 私人网盘服务端** — Personal NAS server over P2P (webrpc)
 
-人在外面也能浏览、上传、下载家里电脑或 NAS 上的文件。不需要公网 IP、不需要路由器端口映射、也不把文件上传到第三方网盘。传输走 [webrpc](https://www.webrpc.cn/controllor.html) 加密 P2P 通道；手机和电脑端用 [File2File](https://github.com/xiaoming-software/File2File-Desktop) 桌面客户端连接并操作网盘。
+人在外面也能浏览、上传、下载家里电脑或 NAS 上的文件。不需要公网 IP、不需要路由器端口映射、也不把文件上传到第三方网盘。传输走 [webrpc](https://www.webrpc.cn/controllor.html) 加密 P2P 通道；电脑端用 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) 连接网盘，手机端用 [File2File App](https://github.com/xiaoming-software/File2File-App) 连接网盘。
 
 [English README](README.en.md)
 
-**关键词：** 个人 NAS、私人网盘、无公网 IP、P2P 网盘、webrpc、File2File、macOS / Linux / Windows、树莓派、ARM NAS
+**关键词：** 个人 NAS、私人网盘、无公网 IP、P2P 网盘、webrpc、File2File、File2File App、macOS / Linux / Windows / Android / iOS、树莓派、ARM NAS
 
 ---
 
@@ -60,7 +60,7 @@ webrpc 运行库已嵌入各平台可执行文件，**发布目录里不需要�
 
 1. 在 NAS / 家里电脑上启动 `mywebdisk-server`，传入该设备的 webrpc **Token、密码、口令** 和本地目录。
 2. 服务端登录 webrpc，在本机回调端口上等待会话。
-3. 另一台设备打开 File2File，用**另一枚** Token 登录。
+3. 另一台电脑打开 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop)，或手机打开 [File2File App](https://github.com/xiaoming-software/File2File-App)，用**另一枚** Token 登录。
 4. 在「网盘连接」里填写服务端 Token 和同一条口令，建立 P2P 会话。
 5. 之后的列目录、上传下载都走这条加密通道，不经过中心化存储。
 
@@ -99,7 +99,7 @@ webrpc 运行库已嵌入各平台可执行文件，**发布目录里不需要�
 3. **一块本地磁盘目录**  
    例如 `/Users/you/mywebdisk_space`、`D:\nas`、`/mnt/data/nas`。不存在会自动创建。
 4. **客户端**  
-   安装 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop)。
+   电脑端安装 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop)；手机端安装 [File2File App](https://github.com/xiaoming-software/File2File-App)。
 
 ---
 
@@ -219,12 +219,13 @@ NAS 目录: /Users/a1/mywebdisk_space
 
 ## 用 File2File 连接网盘
 
-客户端仓库：[xiaoming-software/File2File-Desktop](https://github.com/xiaoming-software/File2File-Desktop)
+- 电脑端请使用 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) 连接网盘。
+- 手机端请使用 [File2File App](https://github.com/xiaoming-software/File2File-App) 连接网盘。
 
-1. 安装并启动 File2File（macOS / Windows / Linux 均可）。
+1. 安装并启动客户端（桌面：macOS / Windows / Linux；手机：Android / iOS）。
 2. 用**客户端自己的** webrpc Token 和密码登录。认证口令可按 File2File 说明填写；这与网盘口令不是同一件事。
-3. 左侧找到 **网盘连接**，点 **新建连接** 或选已保存的节点（例如「家里网盘mac」）。
-4. 在「请先连接网盘」窗口填写：
+3. 打开 **网盘连接**（桌面端在左侧；手机端在「网盘」页），点 **新建连接** 或选已保存的节点（例如「家里网盘mac」）。
+4. 在连接窗口填写：
    - **网盘 Token**：服务端 `--token`
    - **认证口令**：服务端 `--permission`
 5. 点 **连接**。成功后即可看磁盘用量、浏览目录、上传、搜索。
@@ -293,7 +294,8 @@ dist/windows-amd64/mywebdisk-server.exe
 | 项目 | 作用 |
 | --- | --- |
 | 本仓库 **MyWebDisk** | 个人 NAS 服务端 |
-| [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) | 连接并操作网盘的桌面客户端，也支持聊天与直传文件 |
+| [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop) | 电脑端客户端，连接并操作网盘，也支持聊天与直传文件 |
+| [File2File App](https://github.com/xiaoming-software/File2File-App) | 手机端客户端（Android / iOS），连接并操作网盘 |
 | [webrpc](https://www.webrpc.cn/controllor.html) | P2P RPC 传输与 Token 服务 |
 
 问题与建议请在本仓库提 Issue。请自行保管 Token 与口令。
