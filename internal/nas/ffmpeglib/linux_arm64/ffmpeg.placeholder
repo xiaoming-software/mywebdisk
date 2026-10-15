@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "ffmpeg placeholder; run ./build.sh" >&2
+exit 127

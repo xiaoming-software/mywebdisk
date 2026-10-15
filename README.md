@@ -46,6 +46,7 @@
 服务端是一条命令即可运行的 Go 程序。绑定一个本地目录后，经 File2File 可完成：
 
 - **浏览目录**：列表 / 图标视图，路径限制在 `--path` 内，禁止 `../` 越界
+- **缩略图**：`getThumb` / `backThumb`，图片用纯 Go 解码缩放；视频用 **构建时嵌入的静态 ffmpeg** 抽帧（`./build.sh` 自动下载并打进二进制，用户无需另装）；缓存目录为网盘根下 `.mywebdisk_thumbs`
 - **磁盘信息**：总容量、剩余、已用、文件数量
 - **上传 / 下载**：大文件分块传输
 - **新建、重命名、移动、删除** 文件和文件夹
@@ -244,6 +245,8 @@ cd mywebdisk
 ./build.sh
 ```
 
+`./build.sh` 会自动下载各平台静态 ffmpeg（[ffmpeg-static](https://github.com/eugeneware/ffmpeg-static)），临时嵌入后再还原占位文件。需能访问 GitHub；下载缓存在 `.ffmpeg-cache/`。每个平台二进制会因此增大约数十 MB。
+
 产物：
 
 ```text
@@ -286,6 +289,9 @@ dist/windows-amd64/mywebdisk-server.exe
 
 **Q：可以当多人共享网盘吗？**  
 协议上多个 File2File 可以连同一台服务端，但本项目按**个人 NAS** 设计：知道 Token + 口令的人都能操作该目录，请自行控制分享范围。
+
+**Q：视频没有缩略图？**  
+请使用 `./build.sh` 编译的发行版（内嵌静态 ffmpeg）。图片缩略图不依赖 ffmpeg；视频抽帧失败时客户端会回退为类型图标，不影响浏览。生成成功的缩略图缓存在网盘根目录的 `.mywebdisk_thumbs`。二进制体积会因嵌入 ffmpeg 增大约数十 MB。
 
 ---
 

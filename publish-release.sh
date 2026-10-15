@@ -10,7 +10,7 @@
 #   dist/windows-amd64/mywebdisk-server.exe
 
 # ---- 每次发布只改这里 ----
-VERSION=1.0.0
+VERSION=1.1.0
 # --------------------------
 
 set -e

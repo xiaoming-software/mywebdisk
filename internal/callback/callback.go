@@ -1,6 +1,7 @@
 package callback
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -55,6 +56,7 @@ type envelope struct {
 	NewFileName string          `json:"newFileName"`
 	NewName     string          `json:"newName"`
 	Size        *uint64         `json:"size"`
+	MaxEdge     int             `json:"maxEdge"`
 }
 
 // Listen connects to the local webrpc callback port and handles data frames.
@@ -137,6 +139,8 @@ func handleData(sessionID uint32, payload []byte, root string, send SendFunc, se
 		handleGetPath(sessionID, env.Data, root, send)
 	case "getFile":
 		go handleGetFile(sessionID, env.FileName, env.FilePath, root, send, sendFile)
+	case "getThumb":
+		go handleGetThumb(sessionID, env.FileName, env.FilePath, env.MaxEdge, root, send)
 	case "putFile":
 		handlePutFile(sessionID, env.FileName, env.FilePath, env.Size, root)
 	case "createFile":
@@ -305,6 +309,55 @@ func handleGetPath(sessionID uint32, raw json.RawMessage, root string, send Send
 	}
 	ret := send(sessionID, body)
 	log.Printf("backPath session=%d path=%s files=%d send=%d", sessionID, reqPath, len(entries), ret)
+}
+
+func handleGetThumb(sessionID uint32, fileName, filePath string, maxEdge int, root string, send SendFunc) {
+	if send == nil {
+		log.Printf("getThumb session=%d 无 SendData 回调", sessionID)
+		return
+	}
+	fail := func(msg string) {
+		body, err := json.Marshal(map[string]any{
+			"type":     "backThumb",
+			"ok":       false,
+			"error":    msg,
+			"fileName": fileName,
+			"filePath": filePath,
+		})
+		if err != nil {
+			return
+		}
+		send(sessionID, body)
+	}
+	if !nas.CanThumb(fileName) {
+		fail("unsupported")
+		return
+	}
+	res, err := nas.MakeThumb(root, filePath, fileName, maxEdge)
+	if err != nil {
+		log.Printf("getThumb session=%d path=%s name=%s 失败: %v", sessionID, filePath, fileName, err)
+		fail(err.Error())
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"type":     "backThumb",
+		"ok":       true,
+		"fileName": fileName,
+		"filePath": filePath,
+		"mime":     "image/jpeg",
+		"edge":     res.Edge,
+		"cached":   res.Cached,
+		"data":     base64.StdEncoding.EncodeToString(res.JPEG),
+	})
+	if err != nil {
+		log.Printf("序列化 backThumb 失败: %v", err)
+		return
+	}
+	ret := send(sessionID, body)
+	log.Printf(
+		"backThumb session=%d path=%s name=%s bytes=%d cached=%v send=%d",
+		sessionID, filePath, fileName, len(res.JPEG), res.Cached, ret,
+	)
 }
 
 func handleGetFile(sessionID uint32, fileName, filePath, root string, send SendFunc, sendFile SendFileFunc) {

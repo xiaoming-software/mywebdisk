@@ -1,0 +1,8 @@
+#!/bin/sh
+# Placeholder replaced by ./build.sh with a static ffmpeg binary.
+# Until then, forward to a system ffmpeg so local darwin builds still work.
+if command -v ffmpeg >/dev/null 2>&1; then
+  exec ffmpeg "$@"
+fi
+echo "ffmpeg not embedded; run ./build.sh" >&2
+exit 127
