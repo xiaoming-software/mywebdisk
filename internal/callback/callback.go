@@ -31,19 +31,43 @@ type fileRecv struct {
 }
 
 type pendingPut struct {
-	fileName string
-	filePath string
-	dest     string
-	at       time.Time
+	fileName   string
+	filePath   string
+	dest       string
+	expected   uint64
+	written    uint64
+	file       *os.File
+	at         time.Time
+	lastReport time.Time
+	timer      *time.Timer
+	gen        uint64
 }
 
 const putFileTTL = 2 * time.Minute
+const putProgressEvery = 200 * time.Millisecond
+
+// putChunkOutcome decides whether a putFile transfer is finished.
+// A short chunk is the sender's end-of-file marker. A full chunk finishes
+// only when the announced size has been reached. Extra bytes are a failure.
+func putChunkOutcome(written, expected uint64, chunkLen uint32) (done bool, failed bool) {
+	if expected > 0 && written > expected {
+		return true, true
+	}
+	if expected > 0 && written == expected {
+		return true, false
+	}
+	if chunkLen < fileChunkSize {
+		return true, true
+	}
+	return false, false
+}
 
 var (
 	fileMu    sync.Mutex
 	fileRecvs = map[string]*fileRecv{}
 	putMu     sync.Mutex
 	puts      = map[uint32]*pendingPut{}
+	putGen    uint64
 )
 
 type envelope struct {
@@ -116,7 +140,7 @@ func drain(addr, root string, send SendFunc, sendFile SendFileFunc) error {
 			if err != nil {
 				return fmt.Errorf("读文件长度: %w", err)
 			}
-			if err := writeFileChunk(sessionID, string(name), conn, dataLen, root); err != nil {
+			if err := writeFileChunk(sessionID, string(name), conn, dataLen, root, send); err != nil {
 				return fmt.Errorf("写文件分片: %w", err)
 			}
 		default:
@@ -142,7 +166,7 @@ func handleData(sessionID uint32, payload []byte, root string, send SendFunc, se
 	case "getThumb":
 		go handleGetThumb(sessionID, env.FileName, env.FilePath, env.MaxEdge, root, send)
 	case "putFile":
-		handlePutFile(sessionID, env.FileName, env.FilePath, env.Size, root)
+		handlePutFile(sessionID, env.FileName, env.FilePath, env.Size, root, send)
 	case "createFile":
 		handleCreateFile(sessionID, env.Data, root, send)
 	case "moveFile":
@@ -162,41 +186,127 @@ func handleData(sessionID uint32, payload []byte, root string, send SendFunc, se
 	}
 }
 
-func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, root string) {
+func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, root string, send SendFunc) {
 	dest, err := nas.ResolveWriteTarget(root, filePath, fileName)
 	if err != nil {
 		log.Printf("putFile 非法 session=%d path=%s name=%s: %v", sessionID, filePath, fileName, err)
+		sendBackPut(send, sessionID, fileName, filePath, 0, 0, true, false, "invalid-path")
 		return
 	}
-	if size != nil && *size == 0 {
+	abortPut(sessionID, send, "replaced")
+	if size == nil {
+		log.Printf("putFile 缺少 size session=%d path=%s name=%s", sessionID, filePath, fileName)
+		sendBackPut(send, sessionID, fileName, filePath, 0, 0, true, false, "missing-size")
+		return
+	}
+	if *size == 0 {
 		if err := os.WriteFile(dest, []byte{}, 0o644); err != nil {
 			log.Printf("putFile 清空失败 session=%d dest=%s: %v", sessionID, dest, err)
+			sendBackPut(send, sessionID, fileName, filePath, 0, 0, true, false, "write")
 			return
 		}
-		putMu.Lock()
-		delete(puts, sessionID)
-		putMu.Unlock()
+		info, statErr := os.Stat(dest)
+		if statErr != nil || info.Size() != 0 {
+			_ = os.Remove(dest)
+			sendBackPut(send, sessionID, fileName, filePath, 0, 0, true, false, "size-mismatch")
+			return
+		}
 		log.Printf("putFile 空文件 session=%d path=%s name=%s dest=%s", sessionID, filePath, fileName, dest)
+		sendBackPut(send, sessionID, fileName, filePath, 0, 0, true, true, "")
+		return
+	}
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		log.Printf("putFile 打开失败 session=%d dest=%s: %v", sessionID, dest, err)
+		sendBackPut(send, sessionID, fileName, filePath, 0, *size, true, false, "write")
 		return
 	}
 	putMu.Lock()
-	puts[sessionID] = &pendingPut{
+	putGen++
+	gen := putGen
+	st := &pendingPut{
 		fileName: fileName,
 		filePath: filePath,
 		dest:     dest,
+		expected: *size,
+		file:     f,
 		at:       time.Now(),
+		gen:      gen,
+	}
+	st.timer = time.AfterFunc(putFileTTL, func() { expirePut(sessionID, gen, send) })
+	puts[sessionID] = st
+	putMu.Unlock()
+	log.Printf("putFile session=%d path=%s name=%s dest=%s size=%d", sessionID, filePath, fileName, dest, *size)
+}
+
+func abortPut(sessionID uint32, send SendFunc, reason string) {
+	putMu.Lock()
+	st := puts[sessionID]
+	if st == nil {
+		putMu.Unlock()
+		return
+	}
+	delete(puts, sessionID)
+	if st.timer != nil {
+		st.timer.Stop()
 	}
 	putMu.Unlock()
-	log.Printf("putFile session=%d path=%s name=%s dest=%s", sessionID, filePath, fileName, dest)
+	closePutFile(st)
+	_ = os.Remove(st.dest)
+	log.Printf("putFile 中止 session=%d dest=%s reason=%s written=%d", sessionID, st.dest, reason, st.written)
+	sendBackPut(send, sessionID, st.fileName, st.filePath, st.written, st.expected, true, false, reason)
+}
+
+func expirePut(sessionID uint32, gen uint64, send SendFunc) {
+	putMu.Lock()
+	st := puts[sessionID]
+	if st == nil || st.gen != gen {
+		putMu.Unlock()
+		return
+	}
+	delete(puts, sessionID)
+	putMu.Unlock()
+	closePutFile(st)
+	_ = os.Remove(st.dest)
+	log.Printf("putFile 超时 session=%d dest=%s written=%d size=%d", sessionID, st.dest, st.written, st.expected)
+	sendBackPut(send, sessionID, st.fileName, st.filePath, st.written, st.expected, true, false, "timeout")
+}
+
+func closePutFile(st *pendingPut) {
+	if st != nil && st.file != nil {
+		_ = st.file.Close()
+		st.file = nil
+	}
+}
+
+func sendBackPut(send SendFunc, sessionID uint32, fileName, filePath string, written, size uint64, done, ok bool, errText string) {
+	if send == nil {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"type":     "backPut",
+		"fileName": fileName,
+		"filePath": filePath,
+		"written":  written,
+		"size":     size,
+		"done":     done,
+		"ok":       ok,
+		"error":    errText,
+	})
+	if err != nil {
+		log.Printf("序列化 backPut 失败: %v", err)
+		return
+	}
+	ret := send(sessionID, body)
+	log.Printf(
+		"backPut session=%d path=%s name=%s written=%d size=%d done=%v ok=%v error=%s send=%d",
+		sessionID, filePath, fileName, written, size, done, ok, errText, ret,
+	)
 }
 
 func resolveIncomingDest(sessionID uint32, rawName, root string) (string, error) {
 	putMu.Lock()
 	st := puts[sessionID]
-	if st != nil && time.Since(st.at) > putFileTTL {
-		delete(puts, sessionID)
-		st = nil
-	}
 	if st != nil {
 		dest := st.dest
 		putMu.Unlock()
@@ -208,13 +318,132 @@ func resolveIncomingDest(sessionID uint32, rawName, root string) (string, error)
 
 func clearPendingPut(sessionID uint32, dest string) {
 	putMu.Lock()
-	if st := puts[sessionID]; st != nil && st.dest == dest {
+	if st := puts[sessionID]; st != nil && st.file == nil && st.dest == dest {
 		delete(puts, sessionID)
 	}
 	putMu.Unlock()
 }
 
-func writeFileChunk(sessionID uint32, rawName string, r io.Reader, n uint32, root string) error {
+func writeFileChunk(sessionID uint32, rawName string, r io.Reader, n uint32, root string, send SendFunc) error {
+	putMu.Lock()
+	st := puts[sessionID]
+	var f *os.File
+	if st != nil {
+		f = st.file
+	}
+	putMu.Unlock()
+	if st != nil && f != nil {
+		return writePutChunk(sessionID, f, r, n, send)
+	}
+	return writeLooseChunk(sessionID, rawName, r, n, root)
+}
+
+func writePutChunk(sessionID uint32, f *os.File, r io.Reader, n uint32, send SendFunc) error {
+	buf := make([]byte, 256*1024)
+	left := int(n)
+	for left > 0 {
+		want := len(buf)
+		if want > left {
+			want = left
+		}
+		nr, err := io.ReadFull(r, buf[:want])
+		if nr > 0 {
+			nw, werr := f.Write(buf[:nr])
+			if nw > 0 {
+				reportPutWrite(sessionID, uint64(nw), n, send, false)
+			}
+			if werr != nil || nw != nr {
+				failPut(sessionID, send, "write")
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("写入不完整")
+			}
+		}
+		if err != nil {
+			failPut(sessionID, send, "write")
+			return err
+		}
+		left -= nr
+	}
+	reportPutWrite(sessionID, 0, n, send, true)
+	return nil
+}
+
+func reportPutWrite(sessionID uint32, add uint64, chunkLen uint32, send SendFunc, chunkDone bool) {
+	putMu.Lock()
+	st := puts[sessionID]
+	if st == nil {
+		putMu.Unlock()
+		return
+	}
+	st.written += add
+	st.at = time.Now()
+	written, expected := st.written, st.expected
+	name, path, dest := st.fileName, st.filePath, st.dest
+	done, failed := false, false
+	if chunkDone {
+		done, failed = putChunkOutcome(written, expected, chunkLen)
+	}
+	report := done || time.Since(st.lastReport) >= putProgressEvery
+	if report {
+		st.lastReport = time.Now()
+	}
+	var file *os.File
+	if done {
+		if st.timer != nil {
+			st.timer.Stop()
+		}
+		file = st.file
+		st.file = nil
+		delete(puts, sessionID)
+	}
+	putMu.Unlock()
+
+	if !done {
+		if report {
+			sendBackPut(send, sessionID, name, path, written, expected, false, false, "")
+		}
+		return
+	}
+	if file != nil {
+		_ = file.Sync()
+		_ = file.Close()
+	}
+	if !failed {
+		info, err := os.Stat(dest)
+		if err != nil || uint64(info.Size()) != expected || written != expected {
+			failed = true
+		}
+	}
+	if failed {
+		_ = os.Remove(dest)
+		log.Printf("putFile 校验失败 session=%d dest=%s written=%d size=%d", sessionID, dest, written, expected)
+		sendBackPut(send, sessionID, name, path, written, expected, true, false, "size-mismatch")
+		return
+	}
+	log.Printf("putFile 完成 session=%d dest=%s bytes=%d", sessionID, dest, written)
+	sendBackPut(send, sessionID, name, path, written, expected, true, true, "")
+}
+
+func failPut(sessionID uint32, send SendFunc, reason string) {
+	putMu.Lock()
+	st := puts[sessionID]
+	if st == nil {
+		putMu.Unlock()
+		return
+	}
+	delete(puts, sessionID)
+	if st.timer != nil {
+		st.timer.Stop()
+	}
+	putMu.Unlock()
+	closePutFile(st)
+	_ = os.Remove(st.dest)
+	sendBackPut(send, sessionID, st.fileName, st.filePath, st.written, st.expected, true, false, reason)
+}
+
+func writeLooseChunk(sessionID uint32, rawName string, r io.Reader, n uint32, root string) error {
 	dest, err := resolveIncomingDest(sessionID, rawName, root)
 	if err != nil {
 		log.Printf("文件流路径非法 session=%d name=%s: %v", sessionID, rawName, err)
@@ -224,10 +453,7 @@ func writeFileChunk(sessionID uint32, rawName string, r io.Reader, n uint32, roo
 	key := fmt.Sprintf("%d:%s", sessionID, dest)
 	fileMu.Lock()
 	st := fileRecvs[key]
-	if st == nil || time.Since(st.at) > 3*time.Second {
-		if st != nil && st.file != nil {
-			st.file.Close()
-		}
+	if st == nil {
 		f, openErr := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 		if openErr != nil {
 			fileMu.Unlock()
@@ -252,12 +478,12 @@ func writeFileChunk(sessionID uint32, rawName string, r io.Reader, n uint32, roo
 		fileMu.Unlock()
 		return err
 	}
-	_ = f.Sync()
 
 	fileMu.Lock()
 	if cur := fileRecvs[key]; cur != nil {
 		cur.at = time.Now()
 		if n < fileChunkSize {
+			_ = cur.file.Sync()
 			cur.file.Close()
 			delete(fileRecvs, key)
 			clearPendingPut(sessionID, dest)
