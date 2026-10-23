@@ -31,20 +31,25 @@ type fileRecv struct {
 }
 
 type pendingPut struct {
-	fileName   string
-	filePath   string
-	dest       string
-	expected   uint64
-	written    uint64
-	file       *os.File
-	at         time.Time
-	lastReport time.Time
-	timer      *time.Timer
-	gen        uint64
+	fileName       string
+	filePath       string
+	dest           string
+	expected       uint64
+	written        uint64
+	file           *os.File
+	at             time.Time
+	lastReport     time.Time
+	lastReportByte uint64
+	timer          *time.Timer
+	gen            uint64
 }
 
+// putFileTTL is an *idle* timeout: reset whenever bytes are written.
+// Absolute wall-clock caps would kill multi-GB uploads that are still progressing.
 const putFileTTL = 2 * time.Minute
-const putProgressEvery = 200 * time.Millisecond
+// 进度回传过密会和文件分片抢同一会话，Windows WiFi 驱动容易掉线；按秒级节流即可。
+const putProgressEvery = 2 * time.Second
+const putProgressBytes = 4 * 1024 * 1024
 
 // putChunkOutcome decides whether a putFile transfer is finished.
 // A short chunk is the sender's end-of-file marker. A full chunk finishes
@@ -264,12 +269,31 @@ func expirePut(sessionID uint32, gen uint64, send SendFunc) {
 		putMu.Unlock()
 		return
 	}
+	// Sliding idle: a write may have happened after this timer was armed.
+	if remaining := putFileTTL - time.Since(st.at); remaining > 0 {
+		st.timer = time.AfterFunc(remaining, func() { expirePut(sessionID, gen, send) })
+		putMu.Unlock()
+		return
+	}
 	delete(puts, sessionID)
 	putMu.Unlock()
 	closePutFile(st)
 	_ = os.Remove(st.dest)
-	log.Printf("putFile 超时 session=%d dest=%s written=%d size=%d", sessionID, st.dest, st.written, st.expected)
+	log.Printf("putFile 空闲超时 session=%d dest=%s written=%d size=%d", sessionID, st.dest, st.written, st.expected)
 	sendBackPut(send, sessionID, st.fileName, st.filePath, st.written, st.expected, true, false, "timeout")
+}
+
+// touchPutIdleTimer re-arms the idle timer while held under putMu.
+// expirePut also re-checks st.at so a late-firing timer cannot kill an active put.
+func touchPutIdleTimer(st *pendingPut, sessionID uint32, send SendFunc) {
+	if st == nil {
+		return
+	}
+	gen := st.gen
+	if st.timer != nil {
+		st.timer.Stop()
+	}
+	st.timer = time.AfterFunc(putFileTTL, func() { expirePut(sessionID, gen, send) })
 }
 
 func closePutFile(st *pendingPut) {
@@ -379,15 +403,22 @@ func reportPutWrite(sessionID uint32, add uint64, chunkLen uint32, send SendFunc
 	}
 	st.written += add
 	st.at = time.Now()
+	// Any successful write renews idle TTL so slow multi-GB transfers can finish.
+	if add > 0 {
+		touchPutIdleTimer(st, sessionID, send)
+	}
 	written, expected := st.written, st.expected
 	name, path, dest := st.fileName, st.filePath, st.dest
 	done, failed := false, false
 	if chunkDone {
 		done, failed = putChunkOutcome(written, expected, chunkLen)
 	}
-	report := done || time.Since(st.lastReport) >= putProgressEvery
+	report := done ||
+		time.Since(st.lastReport) >= putProgressEvery ||
+		written-st.lastReportByte >= putProgressBytes
 	if report {
 		st.lastReport = time.Now()
+		st.lastReportByte = written
 	}
 	var file *os.File
 	if done {
@@ -407,7 +438,7 @@ func reportPutWrite(sessionID uint32, add uint64, chunkLen uint32, send SendFunc
 		return
 	}
 	if file != nil {
-		_ = file.Sync()
+		// 完整性靠 Close 后 Stat 对大小即可；大文件 Sync 会长时间堵会话。
 		_ = file.Close()
 	}
 	if !failed {
@@ -483,7 +514,6 @@ func writeLooseChunk(sessionID uint32, rawName string, r io.Reader, n uint32, ro
 	if cur := fileRecvs[key]; cur != nil {
 		cur.at = time.Now()
 		if n < fileChunkSize {
-			_ = cur.file.Sync()
 			cur.file.Close()
 			delete(fileRecvs, key)
 			clearPendingPut(sessionID, dest)
