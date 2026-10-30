@@ -1,0 +1,5 @@
+# Real static binaries are downloaded into ../../.ffmpeg-cache and
+# temporarily copied over the committed placeholders during ./build.sh.
+# Do not commit multi‑MB ffmpeg binaries here.
+*.bin
+*.tmp

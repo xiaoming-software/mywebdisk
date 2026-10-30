@@ -21,13 +21,17 @@ func Collect(root string) Info {
 }
 
 type BackNasInfo struct {
-	Type string `json:"type"`
-	Data Info   `json:"data"`
+	Type       string   `json:"type"`
+	Data       Info     `json:"data"`
+	DriveProto int      `json:"driveProto"`
+	Caps       []string `json:"caps"`
 }
 
 func MarshalBack(info Info) ([]byte, error) {
 	return json.Marshal(BackNasInfo{
-		Type: "backNasInfo",
-		Data: info,
+		Type:       "backNasInfo",
+		Data:       info,
+		DriveProto: 2,
+		Caps:       []string{"driveResume", "driveRange"},
 	})
 }

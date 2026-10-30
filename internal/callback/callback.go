@@ -85,8 +85,16 @@ type envelope struct {
 	NewFileName string          `json:"newFileName"`
 	NewName     string          `json:"newName"`
 	Size        *uint64         `json:"size"`
-	MaxEdge     int             `json:"maxEdge"`
+	// Offset is bytes already transferred (resume). Omitted / 0 = full rewrite.
+	Offset  *uint64 `json:"offset"`
+	// Length is byte count for readRange (capped server-side).
+	Length *uint64 `json:"length"`
+	// RequestId correlates unordered webrpc replies (statFile / readRange).
+	RequestId string `json:"requestId"`
+	MaxEdge   int    `json:"maxEdge"`
 }
+
+const maxRangeLength = 1 << 20 // 1 MiB per readRange
 
 // Listen connects to the local webrpc callback port and handles data frames.
 func Listen(tcpPort int, root string, send SendFunc, sendFile SendFileFunc) {
@@ -167,11 +175,15 @@ func handleData(sessionID uint32, payload []byte, root string, send SendFunc, se
 	case "getPath":
 		handleGetPath(sessionID, env.Data, root, send)
 	case "getFile":
-		go handleGetFile(sessionID, env.FileName, env.FilePath, root, send, sendFile)
+		go handleGetFile(sessionID, env.FileName, env.FilePath, env.Offset, root, send, sendFile)
+	case "statFile":
+		go handleStatFile(sessionID, env.FileName, env.FilePath, env.RequestId, root, send)
+	case "readRange":
+		go handleReadRange(sessionID, env.FileName, env.FilePath, env.Offset, env.Length, env.RequestId, root, send)
 	case "getThumb":
 		go handleGetThumb(sessionID, env.FileName, env.FilePath, env.MaxEdge, root, send)
 	case "putFile":
-		handlePutFile(sessionID, env.FileName, env.FilePath, env.Size, root, send)
+		handlePutFile(sessionID, env.FileName, env.FilePath, env.Size, env.Offset, root, send)
 	case "createFile":
 		handleCreateFile(sessionID, env.Data, root, send)
 	case "moveFile":
@@ -191,7 +203,7 @@ func handleData(sessionID uint32, payload []byte, root string, send SendFunc, se
 	}
 }
 
-func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, root string, send SendFunc) {
+func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, offset *uint64, root string, send SendFunc) {
 	dest, err := nas.ResolveWriteTarget(root, filePath, fileName)
 	if err != nil {
 		log.Printf("putFile 非法 session=%d path=%s name=%s: %v", sessionID, filePath, fileName, err)
@@ -203,6 +215,10 @@ func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, ro
 		log.Printf("putFile 缺少 size session=%d path=%s name=%s", sessionID, filePath, fileName)
 		sendBackPut(send, sessionID, fileName, filePath, 0, 0, true, false, "missing-size")
 		return
+	}
+	var off uint64
+	if offset != nil {
+		off = *offset
 	}
 	if *size == 0 {
 		if err := os.WriteFile(dest, []byte{}, 0o644); err != nil {
@@ -220,10 +236,47 @@ func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, ro
 		sendBackPut(send, sessionID, fileName, filePath, 0, 0, true, true, "")
 		return
 	}
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if off > *size {
+		log.Printf("putFile offset 非法 session=%d offset=%d size=%d", sessionID, off, *size)
+		sendBackPut(send, sessionID, fileName, filePath, 0, *size, true, false, "bad-offset")
+		return
+	}
+	if off == *size {
+		// Already complete — acknowledge without opening a put slot.
+		info, statErr := os.Stat(dest)
+		if statErr == nil && uint64(info.Size()) == *size {
+			sendBackPut(send, sessionID, fileName, filePath, *size, *size, true, true, "")
+			return
+		}
+		off = 0
+	}
+	var f *os.File
+	if off == 0 {
+		f, err = os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	} else {
+		info, statErr := os.Stat(dest)
+		if statErr != nil || uint64(info.Size()) < off {
+			log.Printf("putFile 续传本地不足 session=%d dest=%s have=%v want=%d", sessionID, dest, statErr, off)
+			sendBackPut(send, sessionID, fileName, filePath, 0, *size, true, false, "resume-mismatch")
+			return
+		}
+		f, err = os.OpenFile(dest, os.O_WRONLY, 0o644)
+		if err == nil {
+			if _, seekErr := f.Seek(int64(off), io.SeekStart); seekErr != nil {
+				_ = f.Close()
+				err = seekErr
+			} else if uint64(info.Size()) > off {
+				// Truncate any bytes beyond resume point.
+				if truncErr := f.Truncate(int64(off)); truncErr != nil {
+					_ = f.Close()
+					err = truncErr
+				}
+			}
+		}
+	}
 	if err != nil {
-		log.Printf("putFile 打开失败 session=%d dest=%s: %v", sessionID, dest, err)
-		sendBackPut(send, sessionID, fileName, filePath, 0, *size, true, false, "write")
+		log.Printf("putFile 打开失败 session=%d dest=%s offset=%d: %v", sessionID, dest, off, err)
+		sendBackPut(send, sessionID, fileName, filePath, off, *size, true, false, "write")
 		return
 	}
 	putMu.Lock()
@@ -234,6 +287,7 @@ func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, ro
 		filePath: filePath,
 		dest:     dest,
 		expected: *size,
+		written:  off,
 		file:     f,
 		at:       time.Now(),
 		gen:      gen,
@@ -241,7 +295,10 @@ func handlePutFile(sessionID uint32, fileName, filePath string, size *uint64, ro
 	st.timer = time.AfterFunc(putFileTTL, func() { expirePut(sessionID, gen, send) })
 	puts[sessionID] = st
 	putMu.Unlock()
-	log.Printf("putFile session=%d path=%s name=%s dest=%s size=%d", sessionID, filePath, fileName, dest, *size)
+	log.Printf("putFile session=%d path=%s name=%s dest=%s size=%d offset=%d", sessionID, filePath, fileName, dest, *size, off)
+	if off > 0 {
+		sendBackPut(send, sessionID, fileName, filePath, off, *size, false, false, "")
+	}
 }
 
 func abortPut(sessionID uint32, send SendFunc, reason string) {
@@ -257,7 +314,10 @@ func abortPut(sessionID uint32, send SendFunc, reason string) {
 	}
 	putMu.Unlock()
 	closePutFile(st)
-	_ = os.Remove(st.dest)
+	// Keep partial on "replaced" so a follow-up putFile{offset} can resume.
+	if reason != "replaced" {
+		_ = os.Remove(st.dest)
+	}
 	log.Printf("putFile 中止 session=%d dest=%s reason=%s written=%d", sessionID, st.dest, reason, st.written)
 	sendBackPut(send, sessionID, st.fileName, st.filePath, st.written, st.expected, true, false, reason)
 }
@@ -278,8 +338,8 @@ func expirePut(sessionID uint32, gen uint64, send SendFunc) {
 	delete(puts, sessionID)
 	putMu.Unlock()
 	closePutFile(st)
-	_ = os.Remove(st.dest)
-	log.Printf("putFile 空闲超时 session=%d dest=%s written=%d size=%d", sessionID, st.dest, st.written, st.expected)
+	// Keep partial so clients with driveResume can putFile{offset} again.
+	log.Printf("putFile 空闲超时 session=%d dest=%s written=%d size=%d (kept for resume)", sessionID, st.dest, st.written, st.expected)
 	sendBackPut(send, sessionID, st.fileName, st.filePath, st.written, st.expected, true, false, "timeout")
 }
 
@@ -616,7 +676,165 @@ func handleGetThumb(sessionID uint32, fileName, filePath string, maxEdge int, ro
 	)
 }
 
-func handleGetFile(sessionID uint32, fileName, filePath, root string, send SendFunc, sendFile SendFileFunc) {
+func mimeFromName(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(lower, ".mp4"), strings.HasSuffix(lower, ".m4v"):
+		return "video/mp4"
+	case strings.HasSuffix(lower, ".webm"):
+		return "video/webm"
+	case strings.HasSuffix(lower, ".mkv"):
+		return "video/x-matroska"
+	case strings.HasSuffix(lower, ".mov"):
+		return "video/quicktime"
+	case strings.HasSuffix(lower, ".avi"):
+		return "video/x-msvideo"
+	case strings.HasSuffix(lower, ".mp3"):
+		return "audio/mpeg"
+	case strings.HasSuffix(lower, ".m4a"), strings.HasSuffix(lower, ".aac"):
+		return "audio/mp4"
+	case strings.HasSuffix(lower, ".wav"):
+		return "audio/wav"
+	case strings.HasSuffix(lower, ".flac"):
+		return "audio/flac"
+	case strings.HasSuffix(lower, ".ogg"), strings.HasSuffix(lower, ".oga"):
+		return "audio/ogg"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func handleStatFile(sessionID uint32, fileName, filePath, requestID, root string, send SendFunc) {
+	if send == nil {
+		return
+	}
+	local, err := nas.ResolveFile(root, filePath, fileName)
+	ok := err == nil
+	var size uint64
+	mime := mimeFromName(fileName)
+	if ok {
+		if info, stErr := os.Stat(local); stErr == nil && !info.IsDir() {
+			size = uint64(info.Size())
+		} else {
+			ok = false
+		}
+	}
+	body, mErr := json.Marshal(map[string]any{
+		"type":      "backStat",
+		"requestId": requestID,
+		"ok":        ok,
+		"fileName":  fileName,
+		"filePath":  filePath,
+		"size":      size,
+		"mime":      mime,
+	})
+	if mErr != nil {
+		log.Printf("序列化 backStat 失败: %v", mErr)
+		return
+	}
+	ret := send(sessionID, body)
+	log.Printf(
+		"backStat session=%d path=%s name=%s ok=%v size=%d req=%s send=%d",
+		sessionID, filePath, fileName, ok, size, requestID, ret,
+	)
+}
+
+func handleReadRange(
+	sessionID uint32,
+	fileName, filePath string,
+	offset, length *uint64,
+	requestID, root string,
+	send SendFunc,
+) {
+	if send == nil {
+		return
+	}
+	fail := func(reason string) {
+		body, _ := json.Marshal(map[string]any{
+			"type":      "backRange",
+			"requestId": requestID,
+			"ok":        false,
+			"fileName":  fileName,
+			"filePath":  filePath,
+			"error":     reason,
+		})
+		send(sessionID, body)
+	}
+	local, err := nas.ResolveFile(root, filePath, fileName)
+	if err != nil {
+		fail("not-found")
+		return
+	}
+	info, stErr := os.Stat(local)
+	if stErr != nil || info.IsDir() {
+		fail("stat")
+		return
+	}
+	total := uint64(info.Size())
+	var off uint64
+	if offset != nil {
+		off = *offset
+	}
+	if off > total {
+		fail("offset")
+		return
+	}
+	var want uint64 = maxRangeLength
+	if length != nil && *length > 0 {
+		want = *length
+	}
+	if want > maxRangeLength {
+		want = maxRangeLength
+	}
+	remain := total - off
+	if want > remain {
+		want = remain
+	}
+	buf := make([]byte, want)
+	if want > 0 {
+		f, openErr := os.Open(local)
+		if openErr != nil {
+			fail("open")
+			return
+		}
+		if _, seekErr := f.Seek(int64(off), io.SeekStart); seekErr != nil {
+			_ = f.Close()
+			fail("seek")
+			return
+		}
+		n, readErr := io.ReadFull(f, buf)
+		_ = f.Close()
+		if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+			fail("read")
+			return
+		}
+		buf = buf[:n]
+		want = uint64(n)
+	}
+	body, mErr := json.Marshal(map[string]any{
+		"type":      "backRange",
+		"requestId": requestID,
+		"ok":        true,
+		"fileName":  fileName,
+		"filePath":  filePath,
+		"offset":    off,
+		"length":    want,
+		"size":      total,
+		"eof":       off+want >= total,
+		"data":      base64.StdEncoding.EncodeToString(buf),
+	})
+	if mErr != nil {
+		log.Printf("序列化 backRange 失败: %v", mErr)
+		return
+	}
+	ret := send(sessionID, body)
+	log.Printf(
+		"backRange session=%d path=%s name=%s off=%d len=%d total=%d req=%s send=%d",
+		sessionID, filePath, fileName, off, want, total, requestID, ret,
+	)
+}
+
+func handleGetFile(sessionID uint32, fileName, filePath string, offset *uint64, root string, send SendFunc, sendFile SendFileFunc) {
 	local, err := nas.ResolveFile(root, filePath, fileName)
 	if err != nil {
 		log.Printf("getFile session=%d path=%s name=%s 失败: %v", sessionID, filePath, fileName, err)
@@ -626,8 +844,70 @@ func handleGetFile(sessionID uint32, fileName, filePath, root string, send SendF
 		log.Printf("getFile session=%d 无 SendFile 回调", sessionID)
 		return
 	}
-	ret := sendFile(sessionID, local)
-	log.Printf("SendFile session=%d path=%s name=%s file=%s ret=%d", sessionID, filePath, fileName, local, ret)
+	var off uint64
+	if offset != nil {
+		off = *offset
+	}
+	sendPath := local
+	var tmp string
+	if off > 0 {
+		info, statErr := os.Stat(local)
+		if statErr != nil {
+			log.Printf("getFile session=%d stat 失败: %v", sessionID, statErr)
+			return
+		}
+		total := uint64(info.Size())
+		if off > total {
+			log.Printf("getFile session=%d offset=%d > size=%d", sessionID, off, total)
+			return
+		}
+		if off == total {
+			if send != nil {
+				body, mErr := json.Marshal(map[string]any{
+					"type":     "backFile",
+					"fileName": fileName,
+					"filePath": filePath,
+					"offset":   off,
+					"size":     total,
+					"ok":       true,
+				})
+				if mErr == nil {
+					send(sessionID, body)
+				}
+			}
+			return
+		}
+		// webrpc SendFile has no offset — slice remaining bytes into a temp file.
+		src, openErr := os.Open(local)
+		if openErr != nil {
+			log.Printf("getFile session=%d open 失败: %v", sessionID, openErr)
+			return
+		}
+		if _, seekErr := src.Seek(int64(off), io.SeekStart); seekErr != nil {
+			_ = src.Close()
+			log.Printf("getFile session=%d seek 失败: %v", sessionID, seekErr)
+			return
+		}
+		tf, tmpErr := os.CreateTemp("", "mywebdisk-get-*")
+		if tmpErr != nil {
+			_ = src.Close()
+			log.Printf("getFile session=%d temp 失败: %v", sessionID, tmpErr)
+			return
+		}
+		tmp = tf.Name()
+		_, copyErr := io.Copy(tf, src)
+		_ = src.Close()
+		_ = tf.Close()
+		if copyErr != nil {
+			_ = os.Remove(tmp)
+			log.Printf("getFile session=%d copy 失败: %v", sessionID, copyErr)
+			return
+		}
+		sendPath = tmp
+		defer os.Remove(tmp)
+	}
+	ret := sendFile(sessionID, sendPath)
+	log.Printf("SendFile session=%d path=%s name=%s file=%s offset=%d ret=%d", sessionID, filePath, fileName, sendPath, off, ret)
 	if ret != 1 {
 		return
 	}
@@ -635,17 +915,25 @@ func handleGetFile(sessionID uint32, fileName, filePath, root string, send SendF
 		log.Printf("getFile session=%d 无 SendData 回调", sessionID)
 		return
 	}
+	info, _ := os.Stat(local)
+	var total uint64
+	if info != nil {
+		total = uint64(info.Size())
+	}
 	body, err := json.Marshal(map[string]any{
 		"type":     "backFile",
 		"fileName": fileName,
 		"filePath": filePath,
+		"offset":   off,
+		"size":     total,
+		"ok":       true,
 	})
 	if err != nil {
 		log.Printf("序列化 backFile 失败: %v", err)
 		return
 	}
 	ack := send(sessionID, body)
-	log.Printf("backFile session=%d path=%s name=%s send=%d", sessionID, filePath, fileName, ack)
+	log.Printf("backFile session=%d path=%s name=%s offset=%d size=%d send=%d", sessionID, filePath, fileName, off, total, ack)
 }
 
 func handleCreateFile(sessionID uint32, raw json.RawMessage, root string, send SendFunc) {
